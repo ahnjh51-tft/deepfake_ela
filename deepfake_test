@@ -1,0 +1,265 @@
+import io, json, warnings
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+
+import numpy as np
+from PIL import Image, ImageChops
+import matplotlib.pyplot as plt
+
+# Optional provenance (C2PA / Content Credentials)
+try:
+    import c2pa  # pip install c2pa   (optional)
+    HAVE_C2PA = True
+except Exception:
+    HAVE_C2PA = False
+
+warnings.simplefilter("ignore")
+
+# ---------- Utilities ----------
+def to_grayscale_arr(im: Image.Image) -> np.ndarray:
+    return np.asarray(im.convert("L"), dtype=np.float32) / 255.0
+
+def show_side_by_side(images, titles=None, max_width=700):
+    n = len(images)
+    plt.figure(figsize=(6*n, 6))
+    for i, im in enumerate(images):
+        plt.subplot(1, n, i+1)
+        if isinstance(im, Image.Image):
+            w, h = im.size
+            scale = min(1.0, max_width / float(w))
+            if scale < 1.0:
+                im = im.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+            plt.imshow(im)
+        else:
+            plt.imshow(im, cmap="gray")
+        plt.axis("off")
+        if titles and i < len(titles):
+            plt.title(titles[i])
+    plt.show()
+
+# ---------- Feature extractors ----------
+def compute_ela(im: Image.Image, quality: int = 95):
+    """
+    Error Level Analysis (ELA):
+    - Recompress to JPEG
+    - Difference from original
+    - Scale residual to 0..255 for visibility
+    Returns: (ela_visual (PIL), stats dict)
+    """
+    base = im.convert("RGB")
+    buf = io.BytesIO()
+    base.save(buf, "JPEG", quality=quality)
+    buf.seek(0)
+    jpeg_im = Image.open(buf)
+
+    ela_raw = ImageChops.difference(base, jpeg_im)
+    extrema = ela_raw.getextrema()  # list of (min,max) per channel
+    max_diff = max([ex[1] for ex in extrema]) or 1
+    scale = 255.0 / float(max_diff)
+
+    arr = np.asarray(ela_raw, dtype=np.float32)
+    arr = np.clip(arr * scale, 0, 255).astype(np.uint8)
+    ela_vis = Image.fromarray(arr)
+
+    arr_gray = np.asarray(ela_vis.convert("L"), dtype=np.float32)
+    stats = {
+        "ela_max": float(arr_gray.max()),
+        "ela_mean": float(arr_gray.mean()),
+        "ela_std":  float(arr_gray.std()),
+    }
+    return ela_vis, stats
+
+def laplacian_variance(im: Image.Image) -> float:
+    """
+    Simple Laplacian-like variance to proxy sharpness/noise (no OpenCV).
+    """
+    g = to_grayscale_arr(im)
+    K = np.array([[0, 1, 0],
+                  [1,-4, 1],
+                  [0, 1, 0]], dtype=np.float32)
+    gp = np.pad(g, ((1,1),(1,1)), mode="reflect")
+    out = np.zeros_like(g)
+    H, W = g.shape
+    for i in range(H):
+        for j in range(W):
+            out[i, j] = np.sum(gp[i:i+3, j:j+3] * K)
+    return float(out.var())
+
+def highfreq_ratio(im: Image.Image, cutoff: float = 0.2) -> float:
+    """
+    Fraction of energy in high frequencies (top 'cutoff' of radial frequencies).
+    cutoff in (0,1). 0.2 => top 20% considered 'high'.
+    """
+    g = to_grayscale_arr(im)
+    H, W = g.shape
+    F = np.fft.fftshift(np.fft.fft2(g))
+    mag = np.abs(F)
+    cy, cx = H//2, W//2
+    yy, xx = np.ogrid[:H, :W]
+    r = np.sqrt((yy - cy)**2 + (xx - cx)**2)
+    rmax = r.max() or 1
+    high_mask = r >= (1.0 - cutoff) * rmax
+    total = np.sum(mag) + 1e-9
+    high = float(np.sum(mag[high_mask]))
+    return high / total
+
+def extract_exif_info(im: Image.Image) -> Dict[str, Any]:
+    exif = {}
+    try:
+        raw = im.getexif()
+        for tag, val in raw.items():
+            try:
+                from PIL import ExifTags
+                tagname = ExifTags.TAGS.get(tag, str(tag))
+            except Exception:
+                tagname = str(tag)
+            exif[tagname] = str(val)
+    except Exception:
+        pass
+    return exif
+
+def try_c2pa_verify(pil_im: Image.Image) -> Optional[Dict[str, Any]]:
+    """
+    If c2pa is available and image has credentials, return minimal verification info.
+    Otherwise None.
+    """
+    if not HAVE_C2PA:
+        return None
+    tmp = io.BytesIO()
+    pil_im.save(tmp, format="PNG")  # use lossless container for inspection
+    tmp.seek(0)
+    try:
+        rep = c2pa.read(tmp)  # may raise if none/unsupported
+        info = {"has_credentials": True}
+        for attr in ("active_manifest", "manifests", "ingredients"):
+            if hasattr(rep, attr):
+                val = getattr(rep, attr)
+                try:
+                    info[attr] = len(val) if hasattr(val, "__len__") else bool(val)
+                except Exception:
+                    info[attr] = bool(val)
+        return info
+    except Exception:
+        return None
+
+# ---------- Scoring ----------
+@dataclass
+class HeuristicResult:
+    ela_mean: float
+    ela_std: float
+    ela_max: float
+    lap_var: float
+    hf_ratio: float
+    exif: Dict[str, Any]
+    c2pa_info: Optional[Dict[str, Any]]
+
+def rule_based_score(h: HeuristicResult) -> Dict[str, Any]:
+    """
+    Explainable suspicion score (0..100). Conservative thresholds; tweak to your data.
+    """
+    score = 0.0
+    reasons = []
+
+    # 1) EXIF presence and 'Software' hints
+    software = (h.exif.get("Software") or "").lower()
+    suspect_generators = [
+        "stable diffusion", "automatic1111", "invokeai", "comfyui",
+        "midjourney", "dall-e", "firefly", "novelai", "stability ai", "leonardo ai"
+    ]
+    if any(s in software for s in suspect_generators):
+        score += 35; reasons.append("EXIF Software suggests a generator.")
+    if len(h.exif) == 0:
+        score += 8; reasons.append("No EXIF metadata (common in edited/AI images).")
+
+    # 2) C2PA reduces suspicion if present
+    if h.c2pa_info and h.c2pa_info.get("has_credentials"):
+        score -= 25; reasons.append("C2PA/Content Credentials detected.")
+
+    # 3) ELA: elevated mean & spread can indicate patchy recompression
+    if h.ela_mean > 18:
+        score += 18; reasons.append("High ELA mean (patchy recompression).")
+    elif h.ela_mean > 12:
+        score += 10; reasons.append("Moderately elevated ELA mean.")
+    if h.ela_std > 25:
+        score += 6; reasons.append("High ELA variance.")
+
+    # 4) Frequency extremes can be odd
+    if h.hf_ratio > 0.42:
+        score += 10; reasons.append("Unusually strong high-frequency energy.")
+    elif h.hf_ratio < 0.12:
+        score += 10; reasons.append("Unusually weak high-frequency energy (over-smoothing).")
+
+    # 5) Very low Laplacian variance -> over-smoothing
+    if h.lap_var < 0.0008:
+        score += 8; reasons.append("Very low texture/edge energy.")
+
+    score = float(np.clip(score, 0, 100))
+    if score >= 65:
+        label = "High suspicion"
+    elif score >= 35:
+        label = "Medium suspicion"
+    else:
+        label = "Low suspicion"
+    return {"score": score, "label": label, "reasons": reasons}
+
+# ---------- Public API ----------
+def analyze_image(pil_im: Image.Image, display_plots: bool = True) -> Dict[str, Any]:
+    """
+    Returns dict with keys: score, label, reasons, features
+    """
+    im = pil_im.convert("RGB")
+
+    ela_vis, ela_stats = compute_ela(im, quality=95)
+    lap_var = laplacian_variance(im)
+    hf = highfreq_ratio(im, cutoff=0.2)
+    exif = extract_exif_info(im)
+    c2pa_info = try_c2pa_verify(im)
+
+    h = HeuristicResult(
+        ela_mean=ela_stats["ela_mean"],
+        ela_std=ela_stats["ela_std"],
+        ela_max=ela_stats["ela_max"],
+        lap_var=lap_var,
+        hf_ratio=hf,
+        exif=exif,
+        c2pa_info=c2pa_info
+    )
+    result = rule_based_score(h)
+
+    if display_plots:
+        titles = ["Original", "ELA (scaled residual)"]
+        show_side_by_side([im, ela_vis], titles=titles, max_width=700)
+
+        # Simple gauge bar
+        plt.figure(figsize=(6, 1.2))
+        plt.barh([0], [result["score"]], height=0.5)
+        plt.xlim(0, 100)
+        plt.yticks([])
+        plt.title(f"Suspicion Score: {result['score']:.1f} / 100  ({result['label']})")
+        plt.show()
+
+    result["features"] = {
+        "ela_mean": h.ela_mean,
+        "ela_std": h.ela_std,
+        "ela_max": h.ela_max,
+        "laplacian_variance": h.lap_var,
+        "highfreq_ratio": h.hf_ratio,
+        "has_exif": len(h.exif) > 0,
+        "exif_software": exif.get("Software"),
+        "c2pa": c2pa_info
+    }
+    return result
+
+def analyze_image_path(path: str, display_plots: bool = True) -> Dict[str, Any]:
+    im = Image.open(path).convert("RGB")
+    return analyze_image(im, display_plots=display_plots)
+
+print("Loaded. Use analyze_image_path('path/to/image.jpg').")
+print("Note: Scans often strip EXIF and introduce blur/halftone; combine multiple signals & provenance where possible.")
+
+
+# Edit this path to your test image:
+img_path = "Real.jpg"
+
+res = analyze_image_path(img_path, display_plots=True)
+print(json.dumps(res, indent=2))
